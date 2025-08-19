@@ -23,20 +23,62 @@ from sqlalchemy import func, UniqueConstraint
 # -----------------------
 app = Flask(__name__)
 import os
+import time
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///releases.db")
-# Render/Heroku usam prefixo postgres://; o SQLAlchemy espera postgresql+psycopg2://
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
-elif DATABASE_URL.startswith("postgresql://") and "+psycopg" not in DATABASE_URL and "+psycopg2" not in DATABASE_URL:
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+from flask import Flask
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import text
+
+app = Flask(__name__)
+
+def normalize_db_url(url: str) -> str:
+    """Normaliza a DATABASE_URL para Neon + Render."""
+    if not url:
+        return url
+
+    # 1) Força driver psycopg v3 (em vez de psycopg2)
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif url.startswith("postgresql://") and "+psycopg" not in url and "+psycopg2" not in url:
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+    # 2) Garante TLS e remove channel_binding
+    parts = urlsplit(url)
+    q = dict(parse_qsl(parts.query))
+    q.pop("channel_binding", None)
+    q.setdefault("sslmode", "require")
+
+    # 3) Se por acaso vier o host com "-pooler", troca pelo direto
+    netloc = parts.netloc.replace("-pooler.", ".", 1)
+
+    new_query = urlencode(q)
+    return urlunsplit((parts.scheme, netloc, parts.path, new_query, parts.fragment))
+
+DATABASE_URL = normalize_db_url(os.environ.get("DATABASE_URL", "sqlite:///releases.db"))
 
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    "pool_pre_ping": True,   # testa conexão antes de usar (evita conexões mortas)
+    "pool_recycle": 300,     # recicla após 5 min (ajuda com free tiers)
+    "pool_timeout": 30,
+    "pool_size": 5,
+    "max_overflow": 2,
+    "connect_args": {"sslmode": "require"},  # reforça TLS
+}
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret")
 
-
 db = SQLAlchemy(app)
+
+# (opcional) healthcheck para testar o DB rapidamente
+@app.route("/health")
+def health():
+    try:
+        db.session.execute(text("SELECT 1"))
+        return "ok", 200
+    except Exception as e:
+        return f"db error: {e}", 500
 
 
 # -----------------------
